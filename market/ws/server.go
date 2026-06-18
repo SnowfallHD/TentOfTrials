@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -26,16 +28,18 @@ type Client struct {
 	send     chan []byte
 	subs     map[types.Symbol]struct{}
 	remote   string
+	lastPong time.Time
 	mu       sync.Mutex
 }
 
 type Hub struct {
-	clients    map[*Client]struct{}
-	register   chan *Client
-	unregister chan *Client
-	broadcast  chan []byte
-	logger     *zap.Logger
-	mu         sync.RWMutex
+	clients           map[*Client]struct{}
+	register          chan *Client
+	unregister        chan *Client
+	broadcast         chan []byte
+	logger            *zap.Logger
+	heartbeatInterval time.Duration
+	mu                sync.RWMutex
 }
 
 type Server struct {
@@ -47,13 +51,27 @@ type Server struct {
 }
 
 func NewHub(logger *zap.Logger) *Hub {
-	return &Hub{
-		clients:    make(map[*Client]struct{}),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-		broadcast:  make(chan []byte, 256),
-		logger:     logger,
+	interval := 30 * time.Second
+	if v := os.Getenv("WS_HEARTBEAT_INTERVAL_SECS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			interval = time.Duration(n) * time.Second
+		}
 	}
+	return &Hub{
+		clients:           make(map[*Client]struct{}),
+		register:          make(chan *Client),
+		unregister:        make(chan *Client),
+		broadcast:         make(chan []byte, 256),
+		logger:            logger,
+		heartbeatInterval: interval,
+	}
+}
+
+// ActiveConnections returns the current number of connected clients.
+func (h *Hub) ActiveConnections() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.clients)
 }
 
 func (h *Hub) Run() {
@@ -152,9 +170,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":  "ok",
-		"service": "tent-market",
-		"time":    time.Now().Unix(),
+		"status":           "ok",
+		"service":          "tent-market",
+		"time":             time.Now().Unix(),
+		"connections":      s.hub.ActiveConnections(),
+		"heartbeat_secs":   int(s.hub.heartbeatInterval.Seconds()),
 	})
 }
 
@@ -175,10 +195,14 @@ func (c *Client) readPump() {
 		c.conn.Close()
 	}()
 
+	deadline := 2 * c.hub.heartbeatInterval
 	c.conn.SetReadLimit(65536)
-	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.conn.SetReadDeadline(time.Now().Add(deadline))
 	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		c.mu.Lock()
+		c.lastPong = time.Now()
+		c.mu.Unlock()
+		c.conn.SetReadDeadline(time.Now().Add(deadline))
 		return nil
 	})
 
@@ -200,7 +224,7 @@ func (c *Client) readPump() {
 }
 
 func (c *Client) writePump() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(c.hub.heartbeatInterval)
 	defer func() {
 		ticker.Stop()
 		c.conn.Close()
