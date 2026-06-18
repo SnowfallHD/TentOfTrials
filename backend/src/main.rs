@@ -9,7 +9,6 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "tent-backend")]
 #[command(about = "Tent of Trials Backend - Distributed Microservices Framework", long_about = None)]
 struct Cli {
-
     #[arg(short, long, default_value = "node-0")]
     node_id: String,
 
@@ -21,6 +20,9 @@ struct Cli {
 
     #[arg(short, long, default_value = "/etc/tent/config.toml")]
     config: String,
+
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    health_addr: String,
 }
 
 #[tokio::main]
@@ -48,15 +50,23 @@ async fn main() -> Result<()> {
     let discovery = ServiceDiscovery::new(config.discovery.clone());
     let broker = MessageBroker::new(config.messaging.clone());
 
+    let health_state = tent_backend::health::HealthState::new();
+    let health_addr = cli.health_addr.clone();
+    tokio::spawn(async move {
+        if let Err(err) =
+            tent_backend::health::serve_health_endpoint(&health_addr, health_state).await
+        {
+            tracing::error!(%err, %health_addr, "health endpoint stopped");
+        }
+    });
+
     registry.initialize().await?;
     discovery.announce(&cli.node_id).await?;
     broker.connect().await?;
 
     tracing::info!("all subsystems initialized successfully, entering main loop");
 
-    let mut signal = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::terminate(),
-    )?;
+    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     tokio::select! {
         _ = signal.recv() => {

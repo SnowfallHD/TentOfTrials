@@ -94,6 +94,35 @@ Common error codes:
 
 ---
 
+## Health Endpoint
+
+### GET /health
+
+Returns structured backend service health details without exposing environment
+variables or secret values.
+
+**Response:**
+
+```json
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "commit": "abc1234",
+  "uptime_seconds": 42,
+  "features": [
+    "service-registry",
+    "service-discovery",
+    "message-broker"
+  ]
+}
+```
+
+- `commit` is read from `GIT_COMMIT` when present and falls back to `unknown`.
+- `uptime_seconds` is measured from backend process startup.
+- `features` is a safe capability list, not an environment dump.
+
+---
+
 ## Market Data Endpoints
 
 ### GET /market/instruments
