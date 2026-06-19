@@ -5,6 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,6 +16,11 @@ import (
 	"github.com/tent-of-trials/market/matching"
 	"github.com/tent-of-trials/market/types"
 	"go.uber.org/zap"
+)
+
+const (
+	defaultHeartbeatInterval = 30 * time.Second
+	heartbeatIntervalEnvVar = "WS_HEARTBEAT_INTERVAL_SECS"
 )
 
 var upgrader = websocket.Upgrader{
@@ -26,16 +35,24 @@ type Client struct {
 	send     chan []byte
 	subs     map[types.Symbol]struct{}
 	remote   string
+	lastPong time.Time
 	mu       sync.Mutex
 }
 
 type Hub struct {
-	clients    map[*Client]struct{}
-	register   chan *Client
-	unregister chan *Client
-	broadcast  chan []byte
-	logger     *zap.Logger
-	mu         sync.RWMutex
+	clients           map[*Client]struct{}
+	register          chan *Client
+	unregister        chan *Client
+	broadcast         chan []byte
+	logger            *zap.Logger
+	heartbeatInterval time.Duration
+	mu                sync.RWMutex
+}
+
+type ConnectionHealth struct {
+	Remote       string    `json:"remote"`
+	LastPong     time.Time `json:"last_pong"`
+	LastPongUnix int64     `json:"last_pong_unix"`
 }
 
 type Server struct {
@@ -46,14 +63,69 @@ type Server struct {
 	srv    *http.Server
 }
 
+func heartbeatIntervalFromEnv() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(heartbeatIntervalEnvVar))
+	if raw == "" {
+		return defaultHeartbeatInterval
+	}
+
+	seconds, err := strconv.Atoi(raw)
+	if err != nil || seconds <= 0 {
+		return defaultHeartbeatInterval
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 func NewHub(logger *zap.Logger) *Hub {
 	return &Hub{
-		clients:    make(map[*Client]struct{}),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-		broadcast:  make(chan []byte, 256),
-		logger:     logger,
+		clients:           make(map[*Client]struct{}),
+		register:          make(chan *Client),
+		unregister:        make(chan *Client),
+		broadcast:         make(chan []byte, 256),
+		logger:            logger,
+		heartbeatInterval: heartbeatIntervalFromEnv(),
 	}
+}
+
+func (h *Hub) heartbeat() time.Duration {
+	if h.heartbeatInterval <= 0 {
+		return defaultHeartbeatInterval
+	}
+	return h.heartbeatInterval
+}
+
+func (h *Hub) ActiveConnectionCount() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.clients)
+}
+
+func (h *Hub) ConnectionHealth() []ConnectionHealth {
+	h.mu.RLock()
+	clients := make([]*Client, 0, len(h.clients))
+	for client := range h.clients {
+		clients = append(clients, client)
+	}
+	h.mu.RUnlock()
+
+	health := make([]ConnectionHealth, 0, len(clients))
+	for _, client := range clients {
+		lastPong := client.LastPong()
+		lastPongUnix := int64(0)
+		if !lastPong.IsZero() {
+			lastPongUnix = lastPong.Unix()
+		}
+		health = append(health, ConnectionHealth{
+			Remote:       client.remote,
+			LastPong:     lastPong,
+			LastPongUnix: lastPongUnix,
+		})
+	}
+
+	sort.Slice(health, func(i, j int) bool {
+		return health[i].Remote < health[j].Remote
+	})
+	return health
 }
 
 func (h *Hub) Run() {
@@ -62,10 +134,11 @@ func (h *Hub) Run() {
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client] = struct{}{}
+			total := len(h.clients)
 			h.mu.Unlock()
 			h.logger.Info("client connected",
 				zap.String("remote", client.remote),
-				zap.Int("total", len(h.clients)),
+				zap.Int("total", total),
 			)
 
 		case client := <-h.unregister:
@@ -74,23 +147,29 @@ func (h *Hub) Run() {
 				delete(h.clients, client)
 				close(client.send)
 			}
+			total := len(h.clients)
 			h.mu.Unlock()
 			h.logger.Info("client disconnected",
 				zap.String("remote", client.remote),
-				zap.Int("total", len(h.clients)),
+				zap.Int("total", total),
 			)
 
 		case message := <-h.broadcast:
-			h.mu.RLock()
+			var stalled []*Client
+			h.mu.Lock()
 			for client := range h.clients {
 				select {
 				case client.send <- message:
 				default:
 					close(client.send)
 					delete(h.clients, client)
+					stalled = append(stalled, client)
 				}
 			}
-			h.mu.RUnlock()
+			h.mu.Unlock()
+			for _, client := range stalled {
+				h.logger.Warn("client dropped because send buffer is full", zap.String("remote", client.remote))
+			}
 		}
 	}
 }
@@ -136,11 +215,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := &Client{
-		hub:    s.hub,
-		conn:   conn,
-		send:   make(chan []byte, 256),
-		subs:   make(map[types.Symbol]struct{}),
-		remote: r.RemoteAddr,
+		hub:      s.hub,
+		conn:     conn,
+		send:     make(chan []byte, 256),
+		subs:     make(map[types.Symbol]struct{}),
+		remote:   r.RemoteAddr,
 	}
 
 	s.hub.register <- client
@@ -155,6 +234,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status":  "ok",
 		"service": "tent-market",
 		"time":    time.Now().Unix(),
+		"websocket": map[string]interface{}{
+			"active_connections": s.hub.ActiveConnectionCount(),
+			"connections":        s.hub.ConnectionHealth(),
+		},
 	})
 }
 
@@ -175,11 +258,12 @@ func (c *Client) readPump() {
 		c.conn.Close()
 	}()
 
+	idleTimeout := 2 * c.hub.heartbeat()
 	c.conn.SetReadLimit(65536)
-	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.conn.SetReadDeadline(time.Now().Add(idleTimeout))
 	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		return nil
+		c.markPong(time.Now())
+		return c.conn.SetReadDeadline(time.Now().Add(idleTimeout))
 	})
 
 	for {
@@ -199,8 +283,20 @@ func (c *Client) readPump() {
 	}
 }
 
+func (c *Client) markPong(t time.Time) {
+	c.mu.Lock()
+	c.lastPong = t
+	c.mu.Unlock()
+}
+
+func (c *Client) LastPong() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastPong
+}
+
 func (c *Client) writePump() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(c.hub.heartbeat())
 	defer func() {
 		ticker.Stop()
 		c.conn.Close()
