@@ -1,0 +1,24 @@
+{
+  "generated_at": "2026-06-24T03:47:12.970909+00:00",
+  "commit": "9b5d4938",
+  "diagnostic_logd": "diagnostic/build-9b5d4938.logd",
+  "diagnostic_logd_error": null,
+  "message_blocker": null,
+  "chunked": false,
+  "chunk_size_bytes": null,
+  "password": "37818b6c9c0e5dc41aaa",
+  "decrypt_command": "encryptly unpack diagnostic/build-9b5d4938.logd <outdir> --password 37818b6c9c0e5dc41aaa",
+  "total_modules": 1,
+  "passed": 1,
+  "failed": 0,
+  "modules": [
+    {
+      "name": "market",
+      "status": "PASS",
+      "elapsed_seconds": 13.051,
+      "artifact": "/src/market/market",
+      "output": "go: downloading go.uber.org/zap v1.27.0\ngo: downloading github.com/google/uuid v1.6.0\ngo: downloading github.com/shopspring/decimal v1.4.0\ngo: downloading github.com/gorilla/websocket v1.5.3\ngo: downloading go.uber.org/multierr v1.10.0"
+    }
+  ],
+  "pr_note": "Include the encrypted diagnostic logd artifact(s): diagnostic/build-9b5d4938.logd. The encrypted .logd is the required diagnostic content for PR review; this JSON file is metadata. Maintainers may ask you to remove these diagnostic artifacts before merging."
+}
